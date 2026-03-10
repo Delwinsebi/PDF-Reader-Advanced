@@ -1,0 +1,10 @@
+# Ignore the huge folders inside subdirectories
+frontend/node_modules/
+backend/venv/
+
+# Ignore Python cache globally
+**/__pycache__/
+*.pyc
+
+# Ignore OS junk
+.DS_Store
