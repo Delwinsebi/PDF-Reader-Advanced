@@ -75,7 +75,7 @@ async def process_pdf(file: UploadFile = File(...)):
             img = Image.open(io.BytesIO(pix.tobytes("png")))
             
             # 2. Perform OCR using Tesseract
-            page_text = pytesseract.image_to_string(img, lang='eng+hin')
+            page_text = pytesseract.image_to_string(img, lang='eng')
             
             parts.append(f"--- Page {page.number + 1} ---")
             parts.append(page_text.strip() if page_text.strip() else "[No text detected]")
