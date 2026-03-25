@@ -1,8 +1,9 @@
 import os
 import fitz
 import io
-import pytesseract
+import numpy as np
 from PIL import Image
+from paddleocr import PaddleOCR
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -10,11 +11,13 @@ from uuid import uuid4
 
 app = FastAPI()
 
-# --- CONFIGURATION ---
-# Set this to the path you got from 'which tesseract'
-pytesseract.pytesseract.tesseract_cmd = r'/usr/bin/tesseract'
+# --- PADDLEOCR CONFIGURATION ---
+# lang='hi' includes both Hindi and English (Latin) scripts
+# use_angle_cls=True automatically fixes rotated scans (no need for OSD)
+ocr = PaddleOCR(use_angle_cls=True, lang='hi', show_log=False)
 
 PDF_STORE: dict[str, bytes] = {}
+OCR_CACHE: dict[str, list] = {} 
 MAX_STORED_DOCS = 8
 
 app.add_middleware(
@@ -28,124 +31,94 @@ class SearchRequest(BaseModel):
     doc_id: str
     query: str
 
-def normalize_text(value: str) -> str:
-    return " ".join(value.split())
-
 def clamp01(value: float) -> float:
     return max(0.0, min(1.0, value))
-
-def save_document(data: bytes) -> str:
-    doc_id = uuid4().hex
-    PDF_STORE[doc_id] = data
-    while len(PDF_STORE) > MAX_STORED_DOCS:
-        oldest_doc_id = next(iter(PDF_STORE))
-        PDF_STORE.pop(oldest_doc_id, None)
-    return doc_id
 
 @app.post("/upload")
 async def process_pdf(file: UploadFile = File(...)):
     data = await file.read()
-    if not data:
-        raise HTTPException(status_code=400, detail="File is empty")
-
-    try:
-        doc = fitz.open(stream=data, filetype="pdf")
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid PDF")
-
-    doc_id = save_document(data)
+    doc = fitz.open(stream=data, filetype="pdf")
+    doc_id = uuid4().hex
+    PDF_STORE[doc_id] = data
+    OCR_CACHE[doc_id] = []
+    
     parts = []
+    digital_text = "".join([page.get_text() for page in doc])
 
-    # Check for digital text layer
-    digital_text = ""
-    for page in doc:
-        digital_text += page.get_text()
-
-    # If the PDF has actual text, use the fast digital extraction
     if len(digital_text.strip()) > 50:
         for page in doc:
-            parts.append(f"--- Page {page.number + 1} ---")
-            parts.append(page.get_text())
+            parts.append(f"--- Page {page.number + 1} ---\n{page.get_text()}")
     else:
-        # It's a scanned PDF - Fallback to Tesseract OCR
-        parts.append("--- [Scanned PDF Detected - Performing OCR] ---")
+        parts.append("--- [Scanned PDF: Processing with PaddleOCR] ---")
         for page in doc:
-            # 1. Render page at high resolution (300 DPI) for better OCR
+            # PaddleOCR works best at 2x resolution
             pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
-            img = Image.open(io.BytesIO(pix.tobytes("png")))
+            img = np.frombuffer(pix.samples, dtype=np.uint8).reshape((pix.height, pix.width, 3))
             
-            # 2. Perform OCR using Tesseract
-            page_text = pytesseract.image_to_string(img, lang='eng')
+            # PaddleOCR returns: [ [ [bbox], (text, confidence) ], ... ]
+            result = ocr.ocr(img, cls=True)
             
-            parts.append(f"--- Page {page.number + 1} ---")
-            parts.append(page_text.strip() if page_text.strip() else "[No text detected]")
+            page_text = ""
+            if result[0]:
+                OCR_CACHE[doc_id].append({
+                    "page": page.number + 1,
+                    "data": result[0],
+                    "width": pix.width,
+                    "height": pix.height
+                })
+                for line in result[0]:
+                    page_text += line[1][0] + " "
+            
+            parts.append(f"--- Page {page.number + 1} ---\n{page_text.strip()}")
 
     doc.close()
     return {"doc_id": doc_id, "text": "\n".join(parts)}
 
-import pandas as pd # Make sure to: pip install pandas
-
-from pytesseract import Output
-
 @app.post("/search")
 async def search_text(payload: SearchRequest):
-    query = normalize_text(payload.query).lower()
-    if not query:
-        return {"query": "", "hits": []}
+    query = payload.query.lower().strip()
+    if not query: return {"hits": []}
 
-    data = PDF_STORE.get(payload.doc_id)
-    if data is None:
-        raise HTTPException(status_code=404, detail="Document not found.")
-
-    doc = fitz.open(stream=data, filetype="pdf")
+    cached_pages = OCR_CACHE.get(payload.doc_id, [])
     hits = []
 
-    try:
-        for page_number, page in enumerate(doc, start=1):
-            # 1. Digital Search (Instant)
-            rects = page.search_for(payload.query)
-            if rects:
-                w, h = page.rect.width, page.rect.height
-                for rect in rects:
-                    hits.append({
-                        "page": page_number,
-                        "x": clamp01(rect.x0 / w),
-                        "y": clamp01(rect.y0 / h),
-                        "w": clamp01(rect.width / w),
-                        "h": clamp01(rect.height / h),
-                    })
-            else:
-                # 2. Scanned OCR Search (Optimized for English)
-                # Using Matrix(2, 2) is the sweet spot for English speed/accuracy
-                pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
-                img = Image.open(io.BytesIO(pix.tobytes("png")))
-                
-                # lang='eng' : Only loads English (Fastest)
-                # --psm 6  : Assumes a single uniform block of text (Very fast)
-                # --oem 1  : Use only the LSTM engine (Modern & fast)
-                tess_config = '--psm 6 --oem 1'
-                
-                d = pytesseract.image_to_data(
-                    img, 
-                    lang='eng', 
-                    config=tess_config, 
-                    output_type=pytesseract.Output.DICT
-                )
-                
-                n_boxes = len(d['text'])
-                for i in range(n_boxes):
-                    found = str(d['text'][i]).lower()
-                    if query in found:
-                        # Filter out low-confidence noise to keep UI clean
-                        if int(d['conf'][i]) > 40: 
-                            hits.append({
-                                "page": page_number,
-                                "x": clamp01(d['left'][i] / pix.width),
-                                "y": clamp01(d['top'][i] / pix.height),
-                                "w": clamp01(d['width'][i] / pix.width),
-                                "h": clamp01(d['height'][i] / pix.height),
-                            })
-    finally:
-        doc.close()
+    # 1. Digital Search (Quick fallback)
+    data = PDF_STORE.get(payload.doc_id)
+    doc = fitz.open(stream=data, filetype="pdf")
+    for page in doc:
+        rects = page.search_for(payload.query)
+        for r in rects:
+            hits.append({
+                "page": page.number + 1,
+                "x": clamp01(r.x0 / page.rect.width),
+                "y": clamp01(r.y0 / page.rect.height),
+                "w": clamp01(r.width / page.rect.width),
+                "h": clamp01(r.height / page.rect.height)
+            })
 
-    return {"query": payload.query, "hits": hits}
+    # 2. Scanned Search (Using Paddle Cache)
+    for page_entry in cached_pages:
+        p_num = page_entry["page"]
+        p_w, p_h = page_entry["width"], page_entry["height"]
+        
+        for line in page_entry["data"]:
+            bbox = line[0] # [[x1,y1], [x2,y2], [x3,y3], [x4,y4]]
+            text = line[1][0].lower()
+            
+            if query in text:
+                # Calculate bounding box from 4 points
+                x_min = min([p[0] for p in bbox])
+                y_min = min([p[1] for p in bbox])
+                x_max = max([p[0] for p in bbox])
+                y_max = max([p[1] for p in bbox])
+                
+                hits.append({
+                    "page": p_num,
+                    "x": clamp01(x_min / p_w),
+                    "y": clamp01(y_min / p_h),
+                    "w": clamp01((x_max - x_min) / p_w),
+                    "h": clamp01((y_max - y_min) / p_h)
+                })
+    
+    doc.close()
+    return {"hits": hits}
