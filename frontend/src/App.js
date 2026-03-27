@@ -18,6 +18,7 @@ function App() {
   const [isExtracting, setIsExtracting] = useState(false);
   const [numPages, setNumPages] = useState(0);
   const [hitsByPage, setHitsByPage] = useState({});
+  const [searchQuery, setSearchQuery] = useState('');
 
   // Cleanup local URL to prevent memory leaks
   useEffect(() => {
@@ -29,7 +30,7 @@ function App() {
   const groupHitsByPage = (hits) => {
     const grouped = {};
     if (!hits) return grouped;
-    hits.forEach(hit => {
+    hits.forEach((hit) => {
       const key = hit.page;
       if (!grouped[key]) grouped[key] = [];
       grouped[key].push(hit);
@@ -44,10 +45,11 @@ function App() {
     // Load PDF in viewer
     const localUrl = URL.createObjectURL(file);
     setFileUrl(localUrl);
-    
+
     // Reset state
     setHitsByPage({});
     setTextContent('');
+    setSearchQuery('');
     setIsExtracting(true);
 
     const formData = new FormData();
@@ -58,10 +60,25 @@ function App() {
       setDocId(response.data.doc_id);
       setTextContent(response.data.text); // Your Python returns {"text": "..."}
     } catch (err) {
-      console.error("Extraction failed", err);
-      setTextContent("Error: Backend failed to process PDF.");
+      console.error('Extraction failed', err);
+      setTextContent('Error: Backend failed to process PDF.');
     } finally {
       setIsExtracting(false);
+    }
+  };
+
+  const runSearch = async (queryText) => {
+    const query = queryText.trim();
+    if (!docId || !query) return;
+
+    try {
+      const response = await axios.post('http://localhost:8000/search', {
+        doc_id: docId,
+        query,
+      });
+      setHitsByPage(groupHitsByPage(response.data.hits));
+    } catch (err) {
+      console.error('Search failed', err);
     }
   };
 
@@ -70,21 +87,27 @@ function App() {
     const selection = window.getSelection().toString().trim();
     if (!selection) return;
 
-    try {
-      const response = await axios.post('http://localhost:8000/search', {
-        doc_id: docId,
-        query: selection
-      });
-      setHitsByPage(groupHitsByPage(response.data.hits));
-    } catch (err) {
-      console.error("Search failed", err);
-    }
+    setSearchQuery(selection);
+    await runSearch(selection);
+  };
+
+  const handleSearchSubmit = async (e) => {
+    e.preventDefault();
+    await runSearch(searchQuery);
   };
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', height: '100vh', fontFamily: 'sans-serif' }}>
       {/* Top Bar */}
-      <header style={{ padding: '15px 25px', background: '#2c3e50', color: '#fff', display: 'flex', justifyContent: 'space-between' }}>
+      <header
+        style={{
+          padding: '15px 25px',
+          background: '#2c3e50',
+          color: '#fff',
+          display: 'flex',
+          justifyContent: 'space-between',
+        }}
+      >
         <div style={{ display: 'flex', gap: '20px', alignItems: 'center' }}>
           <input type="file" accept=".pdf" onChange={handleFileUpload} />
         </div>
@@ -105,15 +128,18 @@ function App() {
                     {/* Highlighting Overlay */}
                     <div style={{ position: 'absolute', inset: 0, pointerEvents: 'none', zIndex: 10 }}>
                       {pageHits.map((hit, idx) => (
-                        <div key={idx} style={{
-                          position: 'absolute',
-                          left: `${hit.x * 100}%`,
-                          top: `${hit.y * 100}%`,
-                          width: `${hit.w * 100}%`,
-                          height: `${hit.h * 100}%`,
-                          backgroundColor: 'rgba(52, 152, 219, 0.4)',
-                          border: '1px solid #2980b9'
-                        }} />
+                        <div
+                          key={idx}
+                          style={{
+                            position: 'absolute',
+                            left: `${hit.x * 100}%`,
+                            top: `${hit.y * 100}%`,
+                            width: `${hit.w * 100}%`,
+                            height: `${hit.h * 100}%`,
+                            backgroundColor: 'rgba(52, 152, 219, 0.4)',
+                            border: '1px solid #2980b9',
+                          }}
+                        />
                       ))}
                     </div>
                   </div>
@@ -124,15 +150,74 @@ function App() {
         </div>
 
         {/* Right: Extracted Text Pane */}
-        <div 
-          style={{ flex: 0.8, padding: '30px', overflowY: 'auto', background: '#fff', borderLeft: '1px solid #ccc', whiteSpace: 'pre-wrap' }}
-          onMouseUp={handleTextSelection}
+        <div
+          style={{
+            flex: 0.8,
+            display: 'flex',
+            flexDirection: 'column',
+            minHeight: 0,
+            background: '#fff',
+            borderLeft: '1px solid #ccc',
+          }}
         >
-          {isExtracting ? (
-            <div style={{ color: '#7f8c8d', textAlign: 'center', marginTop: '50px' }}>AI is reading the document...</div>
-          ) : (
-            textContent || "Upload a PDF to see extracted text here."
-          )}
+          {/* Sticky search bar always visible */}
+          <div
+            style={{
+              position: 'sticky',
+              top: 0,
+              zIndex: 20,
+              background: '#fff',
+              borderBottom: '1px solid #e3e3e3',
+              padding: '16px 20px',
+            }}
+          >
+            <form onSubmit={handleSearchSubmit} style={{ display: 'flex', gap: '10px' }}>
+              <input
+                type="text"
+                value={searchQuery}
+                onChange={(e) => setSearchQuery(e.target.value)}
+                placeholder="Search in document..."
+                style={{
+                  flex: 1,
+                  padding: '10px 12px',
+                  border: '1px solid #cfd8dc',
+                  borderRadius: '8px',
+                  fontSize: '14px',
+                }}
+              />
+              <button
+                type="submit"
+                style={{
+                  padding: '10px 16px',
+                  border: 'none',
+                  borderRadius: '8px',
+                  background: '#2c3e50',
+                  color: '#fff',
+                  fontWeight: 600,
+                  cursor: 'pointer',
+                }}
+              >
+                Search
+              </button>
+            </form>
+          </div>
+
+          {/* Scrollable text area */}
+          <div
+            style={{
+              flex: 1,
+              overflowY: 'auto',
+              padding: '30px',
+              whiteSpace: 'pre-wrap',
+            }}
+            onMouseUp={handleTextSelection}
+          >
+            {isExtracting ? (
+              <div style={{ color: '#7f8c8d', textAlign: 'center', marginTop: '50px' }}>AI is reading the document...</div>
+            ) : (
+              textContent || 'Upload a PDF to see extracted text here.'
+            )}
+          </div>
         </div>
       </div>
     </div>
